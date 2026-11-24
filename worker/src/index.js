@@ -32,7 +32,7 @@
 // wrangler.toml's [vars] (README.md, "Your own build service"). Nothing about a player is kept: an
 // address only counts its builds for a day, hashed, in this location's cache.
 
-const MAIN_REPO = "starling-client/mod-builds";
+const MAIN_REPO = "Pain8055/mod-builds";
 // The repository the service builds in and stores to: env.REPO, the same for every request of a
 // deployment, read at the start of each one.
 let REPO = MAIN_REPO;
