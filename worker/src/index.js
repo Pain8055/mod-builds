@@ -109,7 +109,7 @@ export default {
       return answer(404, { error: NOT_HERE });
     } catch (e) {
       console.log(`${request.method} ${url.pathname}: ${e?.stack ?? e}`);
-      return answer(503, { error: UNAVAILABLE });
+      return answer(503, { error: `${e?.message ?? e}` });
     }
   },
 };
