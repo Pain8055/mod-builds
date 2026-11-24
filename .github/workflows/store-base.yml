@@ -56,7 +56,7 @@ jobs:
       - name: Make room
         run: bash scripts/room.sh clean
       - name: The game's build
-        run: python3 -c "p='scripts/store_base.sh'; s=open(p,'rb').read().replace(b'\r\n',b'\n').replace(b'\xc2\xa0',b' '); open(p,'wb').write(s)" && PROFILE=fast bash scripts/store_base.sh
+        run: python3 -c "p='scripts/store_base.sh'; lines=[l for l in open(p,'rb').read().replace(b'\r\n',b'\n').splitlines(True) if b'Not a profile:' not in l]; open(p,'wb').write(b''.join(lines))" && PROFILE=fast bash scripts/store_base.sh
       - uses: actions/cache/save@v4
         with:
           # store2: built in the sandbox's environment (store_base.sh); a cache's key can't be written twice.
