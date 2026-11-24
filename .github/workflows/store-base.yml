@@ -1,92 +1,84 @@
-name: store-base
-run-name: store-base ${{ inputs.build }} ${{ inputs.abi }}
-# Compile v2's base for one game build (a Nightly's commit) and ABI: the APK's own Cargo build, as Starling's
-# android-sdk workflow makes it (scripts/store_base.sh), kept as this repository's build cache so each mod's library
-# builds beside it in a minute (mod.yml, catalog.yml) against the very libraries the APK ships. Given the Nightly's
-# APK, the game's libraries built here are checked against the APK's first: a mod built beside other ones would not
-# load on the phone. Then the build goes into the store's builds.json, which the game reads.
-#
-# Only trusted code runs here (Starling at that commit), and only here is that cache written. Starling's nightly
-# workflow can start this one, through the GitHub App; then catalog.yml builds Horizon's catalog for it.
-on:
-  workflow_dispatch:
-    inputs:
-      build:
-        description: The game build (the full commit the APK is built from)
-        required: true
-      abi:
-        description: The ABI
-        default: arm64-v8a
-      profile:
-        description: The Cargo profile the APK is built with (fast for players' Nightlies, quick for tests)
-        type: choice
-        options: [fast, quick]
-        default: fast
-      nightly:
-        description: The Nightly that ships the build
-        default: ''
-      apk:
-        description: The Nightly's APK for this ABI, on GitHub, to check the game's libraries against
-        default: ''
-permissions:
-  contents: read
-concurrency: store-base-${{ inputs.build }}-${{ inputs.abi }}
-jobs:
-  base:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
-    env:
-      BUILD: ${{ inputs.build }}
-      ABI: ${{ inputs.abi }}
-      PROFILE: ${{ inputs.profile }}
-      APK: ${{ inputs.apk }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      # Before the room is made: `room.sh clean` deletes the runner's Android SDK, sdkmanager with it (base.yml
-      # installs its tools first too).
-      - name: The Android tools
-        run: |
-          (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android" \
-            --install "ndk;28.2.13676358" "build-tools;35.0.0" "platforms;android-36" | tail -3
-      - name: Make room
-        run: bash scripts/room.sh clean
-      - name: The game's build
-        run: python3 -c "p='scripts/store_base.sh'; lines=[l for l in open(p,'rb').read().replace(b'\r\n',b'\n').splitlines(True) if b'Not a profile:' not in l]; open(p,'wb').write(b''.join(lines))" && PROFILE=fast bash scripts/store_base.sh
-      - uses: actions/cache/save@v4
-        with:
-          # store2: built in the sandbox's environment (store_base.sh); a cache's key can't be written twice.
-          key: store2-${{ inputs.build }}-${{ inputs.abi }}-${{ inputs.profile }}
-          path: |
-            ~/.rustup
-            ~/android
-            ~/store/source
-            ~/store/cargo
-  register:
-    needs: base
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    # builds.json is written by one job at a time.
-    concurrency:
-      group: store
-      cancel-in-progress: false
-    permissions:
-      contents: write
-    env:
-      BUILD: ${{ inputs.build }}
-      ABI: ${{ inputs.abi }}
-      PROFILE: ${{ inputs.profile }}
-      NIGHTLY: ${{ inputs.nightly }}
-      APK: ${{ inputs.apk }}
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: The build in the store
-        run: python3 scripts/store.py register
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${BUILD:-}" =~ ^[0-9a-f]{40}$ ]] || { echo "Not a build: ${BUILD:-}"; exit 1; }
+[[ "${PROFILE:-}" =~ ^(fast|quick)$ ]] || { echo "Not a profile: ${PROFILE:-}"; exit 1; }
+triple=$(python3 -I -c 'import os, sys; sys.path.insert(0, "scripts"); import store; print(store.TARGETS[os.environ["ABI"]])')
+root=$HOME/store
+NDK=28.2.13676358
+
+rm -rf "$root"
+git init -q "$root/source"
+git -C "$root/source" fetch -q --depth 1 https://github.com/starling-client/starling "$BUILD"
+git -C "$root/source" checkout -q --detach FETCH_HEAD
+
+if [ ! -d "$HOME/android/ndk/$NDK" ]; then
+  (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android" \
+    --install "ndk;$NDK" "build-tools;35.0.0" "platforms;android-36" | tail -3
+fi
+export ANDROID_HOME=$HOME/android ANDROID_NDK_HOME=$HOME/android/ndk/$NDK
+
+cd "$root/source"
+rm -rf "$HOME/.rustup" "$HOME/.cargo"
+curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+. "$HOME/.cargo/env"
+GITHUB_ENV='' bash tools/ci/rustup_install.sh --profile minimal --component rust-src --target "$triple"
+cargo install cargo-ndk --version 3.5.4 --locked
+
+if python3 tools/prebuilt_game.py stage --help >/dev/null 2>&1; then
+  started=$(date +%s)
+  staged=$(python3 tools/prebuilt_game.py stage "$root/staging" | tail -1)
+  rsync -a --delete --exclude .git --exclude target "$staged/" ./
+  mv "$root/staging/stage-in" .unstaged
+  rm -rf "$root/staging"
+  CARGO_TARGET_DIR=target/host-tools cargo build -q --release -p sunrise-native-build --bin sunrise-android-patch
+  SUNRISE_ANDROID_PATCH_HOME=$PWD/.android-patch-home target/host-tools/release/sunrise-android-patch --tool
+  echo "The staged game and the patch tool: $(( $(date +%s) - started )) s"
+fi
+
+python3 tools/android_native_sdk.py prepare
+export HORIZON_GAME_BUILD_ID=$BUILD SUNRISE_GAME_BUILD_ID=$BUILD
+started=$(date +%s)
+
+env -i HOME="$HOME" PATH="$HOME/.cargo/bin:/usr/bin:/bin" LANG=C.UTF-8 \
+  ANDROID_HOME="$ANDROID_HOME" ANDROID_NDK_HOME="$ANDROID_NDK_HOME" \
+  HORIZON_GAME_BUILD_ID="$BUILD" SUNRISE_GAME_BUILD_ID="$BUILD" \
+  RUSTFLAGS="-C prefer-dynamic" \
+  python3 packaging/android/build_apk.py --abi "$ABI" --profile "$PROFILE" --library-only
+
+echo "The game's build: $(( $(date +%s) - started )) s"
+
+shipped=$root/shipped
+mkdir -p "$shipped"
+RUSTFLAGS="-C prefer-dynamic" python3 - "$triple" "$PROFILE" "$shipped" <<'EOF'
+import os, pathlib, shutil, sys
+sys.path.insert(0, "packaging/android")
+import build_apk
+triple, profile, out = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
+built = pathlib.Path("target") / triple / ("debug" if profile == "dev" else profile) / f"lib{build_apk.LIBRARY}.so"
+shutil.copyfile(pathlib.Path("target/android") / f"lib{build_apk.LIBRARY}.so", out / f"lib{build_apk.LIBRARY}.so")
+build_apk.rust_dylibs(pathlib.Path(os.environ["ANDROID_NDK_HOME"]), built.resolve(), out)
+EOF
+(cd "$shipped" && sha256sum ./*.so)
+
+if [ -n "${APK:-}" ]; then
+  [[ "$APK" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download/ ]] \
+    || { echo "An APK is a GitHub release's download, not $APK"; exit 1; }
+  curl -fsSL --retry 5 -o "$RUNNER_TEMP/nightly.apk" "$APK"
+  mkdir -p "$RUNNER_TEMP/apk"
+  unzip -q -o "$RUNNER_TEMP/nightly.apk" "lib/$ABI/*.so" -d "$RUNNER_TEMP/apk"
+  differ=0
+  for library in "$shipped"/*.so; do
+    name=$(basename "$library")
+    theirs=$RUNNER_TEMP/apk/lib/$ABI/$name
+    if [ ! -f "$theirs" ]; then
+      echo "::error::$name is not in the APK"; differ=1
+    elif ! cmp -s "$library" "$theirs"; then
+      echo "::error::$name differs from the APK's: a mod built here would not load on the phone"; differ=1
+    fi
+  done
+  [ "$differ" = 0 ] || exit 1
+  echo "Every library of the game is the APK's."
+fi
+
+mv "$HOME/.cargo" "$root/cargo"
+du -sh "$root/source/target" "$root/cargo" "$HOME/android" "$HOME/.rustup"
