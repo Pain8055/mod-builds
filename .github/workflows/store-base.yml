@@ -56,7 +56,7 @@ jobs:
       - name: Make room
         run: bash scripts/room.sh clean
       - name: The game's build
-        run: bash scripts/store_base.sh
+        run: sed -i 's/\r$//' scripts/store_base.sh && bash scripts/store_base.sh
       - uses: actions/cache/save@v4
         with:
           # store2: built in the sandbox's environment (store_base.sh); a cache's key can't be written twice.
